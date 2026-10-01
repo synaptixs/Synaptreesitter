@@ -1,13 +1,17 @@
-use std::{cmp::Ordering, mem};
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+    mem,
+};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use log::debug;
 
-use super::token_conflicts::TokenConflictMap;
+use super::{SymbolIndexer, token_conflicts::TokenConflictMap};
 use crate::{
     OptLevel,
-    dedup::split_state_id_groups,
+    dedup::{SplitCriterion, split_state_id_groups},
     grammars::{LexicalGrammar, SyntaxGrammar, VariableType},
     rules::{AliasMap, Symbol, SymbolType, SymbolView, TokenSet},
     strpool::StrPool,
@@ -118,6 +122,65 @@ struct ConflictBits {
 }
 
 impl ConflictBits {
+    fn new(minimizer: &Minimizer) -> Self {
+        // Precompute word-aligned bitsets so `token_conflicts` can test a candidate
+        // token against a whole state's terminals.
+        //   - per state: which terminal indices have entries
+        //   - per token: which terminal indices it lexically conflicts with
+        //   - the keyword set as bits
+        let n_terminals = minimizer.lexical_grammar.variables.len();
+        let row_words = n_terminals.div_ceil(64);
+        let set = |bits: &mut [u64], index: usize| bits[index / 64] |= 1 << (index % 64);
+
+        let mut state_terminals = vec![0u64; minimizer.parse_table.states.len() * row_words];
+        for (s, state) in minimizer.parse_table.states.iter().enumerate() {
+            let base = s * row_words;
+            let row = &mut state_terminals[base..base + row_words];
+            for symbol in state.terminal_entries.keys() {
+                if let Some(index) = symbol.terminal_index() {
+                    set(row, usize::from(index));
+                }
+            }
+        }
+
+        let mut conflict_rows = vec![0u64; n_terminals * row_words];
+        for i in 0..n_terminals {
+            let base = i * row_words;
+            let row = &mut conflict_rows[base..base + row_words];
+            for j in 0..n_terminals {
+                if minimizer.token_conflict_map.does_conflict(i, j) {
+                    set(row, j);
+                }
+            }
+        }
+
+        let mut keywords = vec![0u64; row_words];
+        for symbol in minimizer.keywords.iter() {
+            if let Some(index) = symbol.terminal_index() {
+                set(&mut keywords, usize::from(index));
+            }
+        }
+
+        let mut internal_external = vec![0u64; row_words];
+        for external in &minimizer.syntax_grammar.external_tokens {
+            if let Some(index) = external
+                .corresponding_internal_token
+                .and_then(Symbol::terminal_index)
+            {
+                set(&mut internal_external, usize::from(index));
+            }
+        }
+
+        Self {
+            row_words,
+            state_terminals,
+            conflict_rows,
+            keywords,
+            internal_external,
+            word_token: minimizer.syntax_grammar.word_token.map(SymbolKey::new),
+        }
+    }
+
     #[inline]
     fn get_conflict_row(&self, token: usize) -> &[u64] {
         let base = token * self.row_words;
@@ -129,6 +192,487 @@ impl ConflictBits {
         let base = state * self.row_words;
         &self.state_terminals[base..base + self.row_words]
     }
+}
+
+/// The first pass of [`Minimizer::merge_compatible_states`]: splits states whose terminal
+/// entries can't be merged.
+struct ConflictPass<'min, 'a> {
+    minimizer: &'min Minimizer<'a>,
+    /// Each state's terminal entries, sorted by symbol.
+    entry_maps: Vec<Vec<(SymbolKey, ActionListId)>>,
+    bits: ConflictBits,
+    /// A hash of each state's reserved words and terminal entries, apart from its shift
+    /// targets, whose groups change as groups split.
+    static_signatures: Vec<u64>,
+    /// Each state's shift targets, sorted by symbol.
+    shift_maps: &'min [Vec<(SymbolKey, ParseStateId)>],
+    /// Scratch for [`SplitCriterion::compatible_with_all`].
+    kept: KeptStates,
+}
+
+impl<'min, 'a> ConflictPass<'min, 'a> {
+    fn new(
+        minimizer: &'min Minimizer<'a>,
+        shift_maps: &'min [Vec<(SymbolKey, ParseStateId)>],
+    ) -> Self {
+        // Precompute sorted terminal entry references for merge-join in states_conflict.
+        // entry_maps[state_id][i] = (symbol_key, action_list_id). Keys are packed u64s
+        // (symbol_key) for easy comparison.
+        let entry_maps = minimizer
+            .parse_table
+            .states
+            .iter()
+            .map(|state| {
+                let mut entries = state
+                    .terminal_entries
+                    .iter()
+                    .map(|(sym, id)| (SymbolKey::new(*sym), *id))
+                    .collect::<Vec<(SymbolKey, ActionListId)>>();
+                entries.sort_unstable_by_key(|&(key, _)| key);
+                entries
+            })
+            .collect::<Vec<_>>();
+
+        // Hash each state's terminal entries once, apart from its shift targets, whose groups
+        // change as groups split.
+        let static_signatures = minimizer
+            .parse_table
+            .states
+            .iter()
+            .map(|state| {
+                let mut hasher = FxHasher::default();
+                state.reserved_words.hash(&mut hasher);
+                for &(key, id) in &entry_maps[state.id as usize] {
+                    key.0.hash(&mut hasher);
+                    for action in minimizer.parse_table.action_lists.get(id) {
+                        match *action {
+                            ParseAction::Shift { is_repetition, .. } => {
+                                is_repetition.hash(&mut hasher);
+                            }
+                            action => action.hash(&mut hasher),
+                        }
+                    }
+                }
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            minimizer,
+            entry_maps,
+            bits: ConflictBits::new(minimizer),
+            static_signatures,
+            shift_maps,
+            kept: KeptStates::new(SymbolIndexer::new(
+                minimizer.syntax_grammar,
+                minimizer.lexical_grammar,
+            )),
+        }
+    }
+
+    /// Whether the state has an entry for `key`.
+    fn has_token(&self, state_id: ParseStateId, key: SymbolKey) -> bool {
+        if key.is_terminal() {
+            let row = self.bits.get_state_row(state_id as usize);
+            let index = key.index() as usize;
+            row[index / 64] & (1 << (index % 64)) != 0
+        } else {
+            self.entry_maps[state_id as usize]
+                .binary_search_by_key(&key, |&(key, _)| key)
+                .is_ok()
+        }
+    }
+
+    /// Whether `key` can be added to `target`, or `target` already has it.
+    fn can_take(&self, target: &ParseState, key: SymbolKey) -> bool {
+        self.has_token(target.id, key)
+            || self
+                .minimizer
+                .token_conflicts(target, &self.bits, key)
+                .is_none()
+    }
+
+    /// [`SplitCriterion::compatible_with_all`], with the kept states merged into `kept_states`.
+    fn compatible_with_merged(
+        &self,
+        kept_states: &mut KeptStates,
+        state: &ParseState,
+        kept: &[u32],
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        let states = &self.minimizer.parse_table.states;
+        for &(key, action_list) in &self.entry_maps[state.id as usize] {
+            let token = kept_states.tokens[kept_states.indexer.index(key.symbol())];
+            if let Some(kept_action_list) = token.action_list
+                && self
+                    .minimizer
+                    .entries_conflict(kept_action_list, action_list, group_ids_by_state_id)
+                    .is_some()
+            {
+                return false;
+            }
+            if (token.count as usize) < kept.len()
+                && !kept_states.addable_to_all(key, kept, |kept_id| {
+                    self.can_take(&states[kept_id as usize], key)
+                })
+            {
+                return false;
+            }
+        }
+        kept_states
+            .merged_tokens
+            .iter()
+            .all(|&key| self.can_take(state, key))
+    }
+}
+
+/// What the states kept so far in a group of the conflict pass have in common, to check a state
+/// against all of them at once. Kept states never need to be split from each other, so any two
+/// agree on every token they share, and one entry per token stands for all of them.
+#[derive(Default)]
+struct KeptStates {
+    /// What the merged states have for each token, by [`SymbolIndexer::index`].
+    tokens: Vec<KeptToken>,
+    /// How many of the kept states are merged into `tokens`.
+    merged_count: usize,
+    /// The tokens that some merged state has.
+    merged_tokens: Vec<SymbolKey>,
+    /// The tokens that have been checked against kept states lacking them.
+    checked_tokens: Vec<SymbolKey>,
+    /// Gives each token its slot in `tokens`.
+    indexer: SymbolIndexer,
+}
+
+/// What the kept states have for a token. See [`KeptStates`].
+#[derive(Clone, Copy, Default)]
+struct KeptToken {
+    /// The action list of the first merged state with this token.
+    action_list: Option<ActionListId>,
+    /// How many merged states have this token.
+    count: u32,
+    /// Whether this token can be added to the kept states that lack it.
+    addable: Addable,
+}
+
+/// Whether a token can be added to the kept states that lack it, as far as they've been
+/// checked, in order.
+#[derive(Clone, Copy)]
+enum Addable {
+    /// To each of the first this many kept states.
+    UpTo(u32),
+    /// Not to one of them.
+    Blocked,
+}
+
+impl Default for Addable {
+    fn default() -> Self {
+        Self::UpTo(0)
+    }
+}
+
+impl KeptStates {
+    fn new(indexer: SymbolIndexer) -> Self {
+        Self {
+            tokens: vec![KeptToken::default(); indexer.token_count() as usize],
+            merged_count: 0,
+            merged_tokens: Vec::new(),
+            checked_tokens: Vec::new(),
+            indexer,
+        }
+    }
+
+    /// Forgets the kept states, for the next group.
+    fn clear(&mut self) {
+        for key in self
+            .merged_tokens
+            .drain(..)
+            .chain(self.checked_tokens.drain(..))
+        {
+            self.tokens[self.indexer.index(key.symbol())] = KeptToken::default();
+        }
+        self.merged_count = 0;
+    }
+
+    /// Merges the entries of the kept states that aren't merged yet.
+    fn merge(&mut self, kept: &[u32], entry_maps: &[Vec<(SymbolKey, ActionListId)>]) {
+        for &state_id in &kept[self.merged_count..] {
+            for &(key, action_list) in &entry_maps[state_id as usize] {
+                let token = &mut self.tokens[self.indexer.index(key.symbol())];
+                if token.action_list.is_none() {
+                    token.action_list = Some(action_list);
+                    self.merged_tokens.push(key);
+                }
+                token.count += 1;
+            }
+        }
+        self.merged_count = kept.len();
+    }
+
+    /// Whether `key` can be added to every kept state that lacks it, asking `can_take` about
+    /// each kept state at most once per group: the answer doesn't depend on the state being
+    /// checked.
+    fn addable_to_all(
+        &mut self,
+        key: SymbolKey,
+        kept: &[u32],
+        mut can_take: impl FnMut(u32) -> bool,
+    ) -> bool {
+        let token = &mut self.tokens[self.indexer.index(key.symbol())];
+        let Addable::UpTo(checked) = token.addable else {
+            return false;
+        };
+        if checked == 0 {
+            self.checked_tokens.push(key);
+        }
+        for &kept_id in &kept[checked as usize..] {
+            if !can_take(kept_id) {
+                token.addable = Addable::Blocked;
+                return false;
+            }
+        }
+        token.addable = Addable::UpTo(kept.len() as u32);
+        true
+    }
+}
+
+impl SplitCriterion<ParseState> for ConflictPass<'_, '_> {
+    fn should_split(
+        &mut self,
+        left: &ParseState,
+        right: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        self.minimizer.states_conflict(
+            left,
+            right,
+            group_ids_by_state_id,
+            &self.entry_maps,
+            &self.bits,
+        )
+    }
+
+    fn signature(
+        &mut self,
+        state: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> Option<u64> {
+        let mut hasher = FxHasher::default();
+        self.static_signatures[state.id as usize].hash(&mut hasher);
+        for &(_, successor) in &self.shift_maps[state.id as usize] {
+            group_ids_by_state_id[successor as usize].hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    /// Whether two states have the same reserved words and terminal entries, with shift
+    /// targets compared by group. Then [`Minimizer::states_conflict`] never separates them,
+    /// and separates either from exactly the same states.
+    fn equivalent(
+        &mut self,
+        left: &ParseState,
+        right: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        let entries1 = &self.entry_maps[left.id as usize];
+        let entries2 = &self.entry_maps[right.id as usize];
+        let action_lists = &self.minimizer.parse_table.action_lists;
+        left.reserved_words == right.reserved_words
+            && entries1.len() == entries2.len()
+            && entries1
+                .iter()
+                .zip(entries2)
+                .all(|(&(key1, id1), &(key2, id2))| {
+                    if key1 != key2 {
+                        return false;
+                    }
+                    if id1.index() == id2.index() {
+                        return true;
+                    }
+                    let actions1 = action_lists.get(id1);
+                    let actions2 = action_lists.get(id2);
+                    actions1.len() == actions2.len()
+                        && actions1.iter().zip(actions2).all(|pair| match pair {
+                            (
+                                ParseAction::Shift {
+                                    state: s1,
+                                    is_repetition: is_repetition1,
+                                },
+                                ParseAction::Shift {
+                                    state: s2,
+                                    is_repetition: is_repetition2,
+                                },
+                            ) => {
+                                group_ids_by_state_id[*s1 as usize]
+                                    == group_ids_by_state_id[*s2 as usize]
+                                    && is_repetition1 == is_repetition2
+                            }
+                            (action1, action2) => action1 == action2,
+                        })
+                })
+    }
+
+    fn start_group(&mut self) {
+        self.kept.clear();
+    }
+
+    /// Checks `state` against what the kept states have in common, which covers everything
+    /// [`Minimizer::states_conflict`] compares:
+    /// - the tokens `state` shares with kept states, whose entries all agree.
+    /// - `state`'s tokens that some kept state lacks, which must be addable to it.
+    /// - the kept states' tokens that `state` lacks, which must be addable to `state`.
+    fn compatible_with_all(
+        &mut self,
+        state: &ParseState,
+        kept: &[u32],
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        self.kept.merge(kept, &self.entry_maps);
+        // The check reads the rest of `self` while it updates the scratch.
+        let mut kept_states = mem::take(&mut self.kept);
+        let compatible =
+            self.compatible_with_merged(&mut kept_states, state, kept, group_ids_by_state_id);
+        self.kept = kept_states;
+        compatible
+    }
+}
+
+/// The second pass of [`Minimizer::merge_compatible_states`], repeated until nothing splits:
+/// splits states whose successors are in different groups.
+struct SuccessorPass<'min, 'a> {
+    minimizer: &'min Minimizer<'a>,
+    /// Each state's shift targets, sorted by symbol.
+    shift_maps: Vec<Vec<(SymbolKey, ParseStateId)>>,
+    /// Each state's nonterminal entries, sorted by symbol.
+    nonterminal_maps: Vec<Vec<(NonterminalIndex, GotoAction)>>,
+}
+
+impl<'min, 'a> SuccessorPass<'min, 'a> {
+    fn new(
+        minimizer: &'min Minimizer<'a>,
+        shift_maps: Vec<Vec<(SymbolKey, ParseStateId)>>,
+    ) -> Self {
+        // Store only the symbol index: all nonterminal entries share the same kind,
+        // so index alone is sufficient for sorting and comparison.
+        let nonterminal_maps = minimizer
+            .parse_table
+            .states
+            .iter()
+            .map(|state| {
+                let mut entries = state
+                    .nonterminal_entries
+                    .iter()
+                    .map(|(sym, action)| {
+                        let Some(index) = sym.non_terminal_index() else {
+                            unreachable!();
+                        };
+                        (u32::from(index), *action)
+                    })
+                    .collect::<Vec<(NonterminalIndex, GotoAction)>>();
+                entries.sort_unstable_by_key(|&(idx, _)| idx);
+                entries
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            minimizer,
+            shift_maps,
+            nonterminal_maps,
+        }
+    }
+}
+
+impl SplitCriterion<ParseState> for SuccessorPass<'_, '_> {
+    fn should_split(
+        &mut self,
+        left: &ParseState,
+        right: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        self.minimizer.state_successors_differ(
+            left,
+            right,
+            group_ids_by_state_id,
+            &self.shift_maps,
+            &self.nonterminal_maps,
+        )
+    }
+
+    fn signature(
+        &mut self,
+        state: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> Option<u64> {
+        let mut hasher = FxHasher::default();
+        for &(key, successor) in &self.shift_maps[state.id as usize] {
+            (key.0, group_ids_by_state_id[successor as usize]).hash(&mut hasher);
+        }
+        for &(index, action) in &self.nonterminal_maps[state.id as usize] {
+            let group = match action {
+                GotoAction::Goto(successor) => Some(group_ids_by_state_id[successor as usize]),
+                GotoAction::ShiftExtra => None,
+            };
+            (index, group).hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    /// Whether two states shift and go to on the same symbols, with successors in the same
+    /// groups. Then [`Minimizer::state_successors_differ`] never separates them, and separates
+    /// either from exactly the same states.
+    fn equivalent(
+        &mut self,
+        left: &ParseState,
+        right: &ParseState,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> bool {
+        let shifts1 = &self.shift_maps[left.id as usize];
+        let shifts2 = &self.shift_maps[right.id as usize];
+        let gotos1 = &self.nonterminal_maps[left.id as usize];
+        let gotos2 = &self.nonterminal_maps[right.id as usize];
+        shifts1.len() == shifts2.len()
+            && gotos1.len() == gotos2.len()
+            && shifts1
+                .iter()
+                .zip(shifts2)
+                .all(|(&(key1, s1), &(key2, s2))| {
+                    key1 == key2
+                        && group_ids_by_state_id[s1 as usize] == group_ids_by_state_id[s2 as usize]
+                })
+            && gotos1
+                .iter()
+                .zip(gotos2)
+                .all(|(&(index1, action1), &(index2, action2))| {
+                    index1 == index2
+                        && match (action1, action2) {
+                            (GotoAction::Goto(s1), GotoAction::Goto(s2)) => {
+                                group_ids_by_state_id[s1 as usize]
+                                    == group_ids_by_state_id[s2 as usize]
+                            }
+                            (GotoAction::ShiftExtra, GotoAction::ShiftExtra) => true,
+                            _ => false,
+                        }
+                })
+    }
+}
+
+/// Why two states can't be merged: either their entries for a token differ, or a token that
+/// only one of them has can't be added to the other.
+#[derive(Clone, Copy)]
+enum Conflict {
+    /// Their entries have different numbers of actions.
+    ActionCounts,
+    /// Their entries shift to these states, which are in different groups.
+    SplitSuccessors(ParseStateId, ParseStateId),
+    /// Their entries have different actions.
+    UnequalActions,
+    /// The token ends a non-terminal extra.
+    EndOfNonTerminalExtra,
+    /// The token is external, so it could conflict lexically with any of the other state's.
+    ExternalToken,
+    /// The token is both internal and external.
+    InternalExternalToken,
+    /// The token conflicts lexically with this terminal, which the other state has.
+    Lexical(usize),
 }
 
 struct Minimizer<'a> {
@@ -280,90 +824,7 @@ impl Minimizer<'_> {
             group_ids_by_state_id.push(state.core_id);
         }
 
-        // Precompute sorted terminal entry references for merge-join in states_conflict.
-        // entry_maps[state_id][i] = (symbol_key, action_list_id). Keys are packed u64s
-        // (symbol_key) for easy comparison.
-        let entry_maps = self
-            .parse_table
-            .states
-            .iter()
-            .map(|state| {
-                let mut entries = state
-                    .terminal_entries
-                    .iter()
-                    .map(|(sym, id)| (SymbolKey::new(*sym), *id))
-                    .collect::<Vec<(SymbolKey, ActionListId)>>();
-                entries.sort_unstable_by_key(|&(key, _)| key);
-                entries
-            })
-            .collect::<Vec<_>>();
-
-        // Precompute word-aligned bitsets so `token_conflicts` can test a candidate
-        // token against a whole state's terminals.
-        //   - per state: which terminal indices have entries
-        //   - per token: which terminal indices it lexically conflicts with
-        //   - the keyword set as bits
-        let n_terminals = self.lexical_grammar.variables.len();
-        let row_words = n_terminals.div_ceil(64);
-        let set = |bits: &mut [u64], index: usize| bits[index / 64] |= 1 << (index % 64);
-
-        let mut state_terminals = vec![0u64; self.parse_table.states.len() * row_words];
-        for (s, state) in self.parse_table.states.iter().enumerate() {
-            let base = s * row_words;
-            let row = &mut state_terminals[base..base + row_words];
-            for symbol in state.terminal_entries.keys() {
-                if let Some(index) = symbol.terminal_index() {
-                    set(row, usize::from(index));
-                }
-            }
-        }
-
-        let mut conflict_rows = vec![0u64; n_terminals * row_words];
-        for i in 0..n_terminals {
-            let base = i * row_words;
-            let row = &mut conflict_rows[base..base + row_words];
-            for j in 0..n_terminals {
-                if self.token_conflict_map.does_conflict(i, j) {
-                    set(row, j);
-                }
-            }
-        }
-
-        let mut keywords = vec![0u64; row_words];
-        for symbol in self.keywords.iter() {
-            if let Some(index) = symbol.terminal_index() {
-                set(&mut keywords, usize::from(index));
-            }
-        }
-
-        let mut internal_external = vec![0u64; row_words];
-        for external in &self.syntax_grammar.external_tokens {
-            if let Some(index) = external
-                .corresponding_internal_token
-                .and_then(Symbol::terminal_index)
-            {
-                set(&mut internal_external, usize::from(index));
-            }
-        }
-
-        let bits = ConflictBits {
-            row_words,
-            state_terminals,
-            conflict_rows,
-            keywords,
-            internal_external,
-            word_token: self.syntax_grammar.word_token.map(SymbolKey::new),
-        };
-
-        split_state_id_groups(
-            &self.parse_table.states,
-            &mut state_ids_by_group_id,
-            &mut group_ids_by_state_id,
-            0,
-            |left, right, groups| self.states_conflict(left, right, groups, &entry_maps, &bits),
-        );
-
-        // Precompute per-state sorted shift actions and nonterminal goto actions.
+        // Precompute per-state sorted shift actions, for both passes.
         // State actions are stable across loop iterations; only group assignments change.
         // Keys are packed u64s (symbol_key) for single-instruction comparison.
         let shift_maps = self
@@ -388,37 +849,26 @@ impl Minimizer<'_> {
             })
             .collect::<Vec<_>>();
 
-        // Store only the symbol index: all nonterminal entries share the same kind,
-        // so index alone is sufficient for sorting and comparison.
-        let nonterminal_maps = self
-            .parse_table
-            .states
-            .iter()
-            .map(|state| {
-                let mut entries = state
-                    .nonterminal_entries
-                    .iter()
-                    .map(|(sym, action)| {
-                        let Some(index) = sym.non_terminal_index() else {
-                            unreachable!();
-                        };
-                        (u32::from(index), *action)
-                    })
-                    .collect::<Vec<(NonterminalIndex, GotoAction)>>();
-                entries.sort_unstable_by_key(|&(idx, _)| idx);
-                entries
-            })
-            .collect::<Vec<_>>();
+        let mut conflict_pass = ConflictPass::new(self, &shift_maps);
+        split_state_id_groups(
+            &self.parse_table.states,
+            &mut state_ids_by_group_id,
+            &mut group_ids_by_state_id,
+            0,
+            &mut conflict_pass,
+        );
+        drop(conflict_pass); // The rest only looks at successors.
+
+        let mut successor_pass = SuccessorPass::new(self, shift_maps);
 
         while split_state_id_groups(
             &self.parse_table.states,
             &mut state_ids_by_group_id,
             &mut group_ids_by_state_id,
             0,
-            |left, right, groups| {
-                self.state_successors_differ(left, right, groups, &shift_maps, &nonterminal_maps)
-            },
+            &mut successor_pass,
         ) {}
+        drop(successor_pass);
 
         let error_group_index = state_ids_by_group_id
             .iter()
@@ -500,14 +950,9 @@ impl Minimizer<'_> {
                     // SAFETY: Equal is only reachable when i < len1 && j < len2.
                     let e1 = unsafe { entries1.get_unchecked(i) };
                     let e2 = unsafe { entries2.get_unchecked(j) };
-                    if self.entries_conflict(
-                        state1.id,
-                        state2.id,
-                        e1.0,
-                        e1.1,
-                        e2.1,
-                        group_ids_by_state_id,
-                    ) {
+                    if let Some(conflict) = self.entries_conflict(e1.1, e2.1, group_ids_by_state_id)
+                    {
+                        self.log_conflict(state1.id, state2.id, e1.0, conflict);
                         return true;
                     }
                     i += 1;
@@ -516,7 +961,8 @@ impl Minimizer<'_> {
                 Ordering::Less => {
                     // SAFETY: Less is only reachable when i < len1.
                     let e1 = unsafe { entries1.get_unchecked(i) };
-                    if self.token_conflicts(state1.id, state2.id, state2, bits, e1.0) {
+                    if let Some(conflict) = self.token_conflicts(state2, bits, e1.0) {
+                        self.log_conflict(state1.id, state2.id, e1.0, conflict);
                         return true;
                     }
                     i += 1;
@@ -524,7 +970,8 @@ impl Minimizer<'_> {
                 Ordering::Greater => {
                     // SAFETY: Greater is only reachable when j < len2.
                     let e2 = unsafe { entries2.get_unchecked(j) };
-                    if self.token_conflicts(state1.id, state2.id, state1, bits, e2.0) {
+                    if let Some(conflict) = self.token_conflicts(state1, bits, e2.0) {
+                        self.log_conflict(state1.id, state2.id, e2.0, conflict);
                         return true;
                     }
                     j += 1;
@@ -610,27 +1057,33 @@ impl Minimizer<'_> {
         false
     }
 
+    /// Why two entries for the same token can't be merged.
+    #[inline]
     fn entries_conflict(
         &self,
-        state_id1: ParseStateId,
-        state_id2: ParseStateId,
-        token: SymbolKey,
         id1: ActionListId,
         id2: ActionListId,
         group_ids_by_state_id: &[ParseStateId],
-    ) -> bool {
+    ) -> Option<Conflict> {
         // To be compatible, entries need to have the same actions.
         if id1.index() == id2.index() {
-            return false;
+            None
+        } else {
+            self.action_lists_conflict(id1, id2, group_ids_by_state_id)
         }
+    }
+
+    /// [`Self::entries_conflict`] for entries with different action lists.
+    fn action_lists_conflict(
+        &self,
+        id1: ActionListId,
+        id2: ActionListId,
+        group_ids_by_state_id: &[ParseStateId],
+    ) -> Option<Conflict> {
         let actions1 = self.parse_table.action_lists.get(id1);
         let actions2 = self.parse_table.action_lists.get(id2);
         if actions1.len() != actions2.len() {
-            debug!(
-                "split states {state_id1} {state_id2} - differing action counts for token {}",
-                self.symbol_name(token.symbol())
-            );
-            return true;
+            return Some(Conflict::ActionCounts);
         }
 
         for (action1, action2) in actions1.iter().zip(actions2.iter()) {
@@ -651,47 +1104,31 @@ impl Minimizer<'_> {
                 if group1 == group2 && is_repetition1 == is_repetition2 {
                     continue;
                 }
-                debug!(
-                    "split states {state_id1} {state_id2} - successors for {} are split: {s1} {s2}",
-                    self.symbol_name(token.symbol()),
-                );
-                return true;
+                return Some(Conflict::SplitSuccessors(*s1, *s2));
             } else if action1 != action2 {
-                debug!(
-                    "split states {state_id1} {state_id2} - unequal actions for {}",
-                    self.symbol_name(token.symbol()),
-                );
-                return true;
+                return Some(Conflict::UnequalActions);
             }
         }
 
-        false
+        None
     }
 
+    /// Why `new_token` can't be added to `right_state`, if it can't.
     #[inline]
     fn token_conflicts(
         &self,
-        left_id: ParseStateId,
-        right_id: ParseStateId,
         right_state: &ParseState,
         bits: &ConflictBits,
         new_token: SymbolKey,
-    ) -> bool {
+    ) -> Option<Conflict> {
         let new_token_is_terminal = new_token.is_terminal();
         let new_token_index = match new_token.tag() {
             tag if tag == SymbolType::EndOfNonTerminalExtra as u64 => {
-                debug!("split states {left_id} {right_id} - end of non-terminal extra");
-                return true;
+                return Some(Conflict::EndOfNonTerminalExtra);
             }
             // Do not add external tokens, as they could conflict lexically with
             // any of the state's existing lookahead tokens.
-            tag if tag == SymbolType::External as u64 => {
-                debug!(
-                    "split states {left_id} {right_id} - external token {}",
-                    self.symbol_name(new_token.symbol()),
-                );
-                return true;
-            }
+            tag if tag == SymbolType::External as u64 => return Some(Conflict::ExternalToken),
             tag if tag == SymbolType::End as u64 => 0,
             tag if tag == SymbolType::Terminal as u64 => new_token.index() as usize,
             _ => unreachable!(),
@@ -705,7 +1142,7 @@ impl Minimizer<'_> {
             right_state.reserved_words.contains(Symbol::End)
         };
         if is_reserved {
-            return false;
+            return None;
         }
 
         // Do not add tokens which are both internal and external. Their validity could
@@ -714,11 +1151,7 @@ impl Minimizer<'_> {
         if new_token_is_terminal
             && bits.internal_external[new_token_index / 64] & (1 << (new_token_index % 64)) != 0
         {
-            debug!(
-                "split states {left_id} {right_id} - internal/external token {}",
-                self.symbol_name(new_token.symbol()),
-            );
-            return true;
+            return Some(Conflict::InternalExternalToken);
         }
 
         let new_token_is_word = bits.word_token == Some(new_token);
@@ -746,20 +1179,53 @@ impl Minimizer<'_> {
                 candidates &= !bits.keywords[w];
             }
             if candidates != 0 {
-                debug!(
-                    "split states {} {} - token {} conflicts with {}",
-                    left_id,
-                    right_id,
-                    self.symbol_name(new_token.symbol()),
-                    self.symbol_name(Symbol::terminal(
-                        w * 64 + candidates.trailing_zeros() as usize
-                    )),
-                );
-                return true;
+                return Some(Conflict::Lexical(
+                    w * 64 + candidates.trailing_zeros() as usize,
+                ));
             }
         }
 
-        false
+        None
+    }
+
+    /// Logs that the states `id1` and `id2` are split because of `conflict`, over `token`.
+    fn log_conflict(
+        &self,
+        id1: ParseStateId,
+        id2: ParseStateId,
+        token: SymbolKey,
+        conflict: Conflict,
+    ) {
+        match conflict {
+            Conflict::ActionCounts => debug!(
+                "split states {id1} {id2} - differing action counts for token {}",
+                self.symbol_name(token.symbol())
+            ),
+            Conflict::SplitSuccessors(s1, s2) => debug!(
+                "split states {id1} {id2} - successors for {} are split: {s1} {s2}",
+                self.symbol_name(token.symbol()),
+            ),
+            Conflict::UnequalActions => debug!(
+                "split states {id1} {id2} - unequal actions for {}",
+                self.symbol_name(token.symbol()),
+            ),
+            Conflict::EndOfNonTerminalExtra => {
+                debug!("split states {id1} {id2} - end of non-terminal extra");
+            }
+            Conflict::ExternalToken => debug!(
+                "split states {id1} {id2} - external token {}",
+                self.symbol_name(token.symbol()),
+            ),
+            Conflict::InternalExternalToken => debug!(
+                "split states {id1} {id2} - internal/external token {}",
+                self.symbol_name(token.symbol()),
+            ),
+            Conflict::Lexical(terminal) => debug!(
+                "split states {id1} {id2} - token {} conflicts with {}",
+                self.symbol_name(token.symbol()),
+                self.symbol_name(Symbol::terminal(terminal)),
+            ),
+        }
     }
 
     fn symbol_name(&self, symbol: Symbol) -> &str {
