@@ -60,6 +60,10 @@ fn find_or_push<T: Eq>(vector: &mut Vec<T>, value: T) {
 
 impl<'a> ParseItemSetBuilder<'a> {
     #[must_use]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "item-set construction state machine"
+    )]
     pub fn new(
         syntax_grammar: &'a SyntaxGrammar,
         lexical_grammar: &'a LexicalGrammar,

@@ -192,6 +192,7 @@ impl Generator {
         Ok(self.buffer)
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "parser render initialization")]
     fn init(&mut self) {
         let mut symbol_identifiers = FxHashSet::default();
         for i in 0..self.parse_table.symbols.len() {
@@ -543,6 +544,7 @@ impl Generator {
         add_line!(self, "");
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "symbol metadata rendering")]
     fn add_symbol_metadata_list(&mut self) {
         add_line!(
             self,
@@ -885,6 +887,7 @@ impl Generator {
         add_line!(self, "");
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "lexer state rendering")]
     fn add_lex_state(&mut self, _state_ix: usize, state: LexState) {
         if let Some(accept_action) = state.accept_action {
             add_line!(self, "ACCEPT_TOKEN({});", self.symbol_ids[&accept_action]);
@@ -1302,6 +1305,7 @@ impl Generator {
         add_line!(self, "");
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "parse table rendering")]
     fn add_parse_table(&mut self) -> RenderResult<()> {
         let mut parse_table_entries = FxHashMap::default();
         let mut next_parse_action_list_index = 0u32;
@@ -1542,6 +1546,7 @@ impl Generator {
         add_line!(self, "");
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "parser export rendering")]
     fn add_parser_export(&mut self) {
         let language_function_name = format!("tree_sitter_{}", self.language_name);
         let external_scanner_name = format!("{language_function_name}_external_scanner");

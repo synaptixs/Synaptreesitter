@@ -457,6 +457,7 @@ impl<'a> ParseTableBuilder<'a> {
         }
     }
 
+    #[expect(clippy::cognitive_complexity, reason = "parse action state machine")]
     fn add_actions(
         &mut self,
         mut preceding_symbols: SymbolSequence,

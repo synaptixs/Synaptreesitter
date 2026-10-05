@@ -68,6 +68,10 @@ static EXAMPLE_AND_QUERY_PATHS_BY_LANGUAGE_DIR: LazyLock<
     result
 });
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "benchmark setup and measurement cases"
+)]
 fn main() {
     tree_sitter_cli::logger::init();
 

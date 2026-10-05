@@ -889,6 +889,10 @@ where
 {
     type Item = Result<HighlightEvent, Error>;
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "streaming injection, scope, and highlight state must advance together"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         'main: loop {
             // If we've already determined the next highlight boundary, just return it.

@@ -344,6 +344,7 @@ pub struct HighlightOptions {
     pub encoding: Option<TSInputEncoding>,
 }
 
+#[expect(clippy::cognitive_complexity, reason = "CLI highlight output modes")]
 pub fn highlight(
     loader: &Loader,
     path: &Path,

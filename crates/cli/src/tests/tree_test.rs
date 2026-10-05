@@ -8,6 +8,7 @@ use crate::{
 };
 
 #[test]
+#[expect(clippy::cognitive_complexity, reason = "tree edit behavior matrix")]
 fn test_tree_edit() {
     let mut parser = Parser::new();
     parser.set_language(&get_language("javascript")).unwrap();
@@ -301,6 +302,7 @@ fn test_tree_edit_with_included_ranges() {
 }
 
 #[test]
+#[expect(clippy::cognitive_complexity, reason = "tree cursor behavior matrix")]
 fn test_tree_cursor() {
     let mut parser = Parser::new();
     parser.set_language(&get_language("rust")).unwrap();
@@ -490,6 +492,10 @@ fn test_tree_cursor_fields() {
 }
 
 #[test]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "cursor point lookup behavior matrix"
+)]
 fn test_tree_cursor_child_for_point() {
     let mut parser = Parser::new();
     parser.set_language(&get_language("javascript")).unwrap();
