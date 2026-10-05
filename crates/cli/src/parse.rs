@@ -278,6 +278,7 @@ pub struct ParseResult {
     pub duration: Option<Duration>,
 }
 
+#[expect(clippy::cognitive_complexity, reason = "CLI parse and output modes")]
 pub fn parse_file_at_path(
     parser: &mut Parser,
     language: &Language,

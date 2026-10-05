@@ -342,6 +342,10 @@ where
 {
     type Item = Result<Tag, Error>;
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "streaming tag capture, scope, and queue state must advance together"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // Periodically check for cancellation, returning `Cancelled` error if the

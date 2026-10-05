@@ -58,6 +58,7 @@ const GRAMMAR_WITH_ALIASES_AND_EXTRAS: &str = r#"{
 }"#;
 
 #[test]
+#[expect(clippy::cognitive_complexity, reason = "node child behavior matrix")]
 fn test_node_child() {
     let tree = parse_json_example();
     let array_node = tree.root_node().child(0).unwrap();
@@ -465,6 +466,7 @@ fn test_node_child_by_field_name_with_extra_hidden_children() {
 }
 
 #[test]
+#[expect(clippy::cognitive_complexity, reason = "named child behavior matrix")]
 fn test_node_named_child() {
     let tree = parse_json_example();
     let array_node = tree.root_node().child(0).unwrap();
@@ -618,6 +620,10 @@ fn test_descendant_count_single_node_tree() {
 }
 
 #[test]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "descendant range behavior matrix"
+)]
 fn test_node_descendant_for_range() {
     let tree = parse_json_example();
     let array_node = tree.root_node();
